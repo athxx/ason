@@ -107,7 +107,9 @@ ason_inline void ason_buf_grow(ason_buf_t* b, size_t need) {
     if (ason_likely(b->len + need <= b->cap)) return;
     size_t nc = b->cap;
     while (nc < b->len + need) nc = nc + (nc >> 1);
-    b->data = (char*)realloc(b->data, nc);
+    char* tmp = (char*)realloc(b->data, nc);
+    if (!tmp) return;  /* OOM: keep old buffer */
+    b->data = tmp;
     b->cap = nc;
 }
 
@@ -169,7 +171,9 @@ ason_inline void ason_string_free(ason_string_t* s) {
     ason_inline void name##_push(name* v, T val) { \
         if (v->len >= v->cap) { \
             v->cap = v->cap < 4 ? 4 : v->cap + (v->cap >> 1); \
-            v->data = (T*)realloc(v->data, v->cap * sizeof(T)); \
+            T* tmp = (T*)realloc(v->data, v->cap * sizeof(T)); \
+            if (!tmp) return; \
+            v->data = tmp; \
         } \
         v->data[v->len++] = val; \
     } \
@@ -571,7 +575,7 @@ ason_inline ason_err_t ason_parse_quoted_string(const char** pos, const char* en
     /* Copy any prefix before the special char */
     if (found > start) {
         len = found - start;
-        if (len > cap) { cap = len * 2; buf = (char*)realloc(buf, cap); }
+        if (len > cap) { cap = len * 2; char* tmp = (char*)realloc(buf, cap); if (!tmp) { free(buf); return ASON_ERR_SYNTAX; } buf = tmp; }
         memcpy(buf, start, len);
     }
     p = found;
@@ -581,7 +585,7 @@ ason_inline ason_err_t ason_parse_quoted_string(const char** pos, const char* en
             p++;
             if (p >= end) { free(buf); return ASON_ERR_SYNTAX; }
             char c = *p++;
-            if (len >= cap) { cap = cap * 2; buf = (char*)realloc(buf, cap); }
+            if (len >= cap) { cap = cap * 2; char* tmp = (char*)realloc(buf, cap); if (!tmp) { free(buf); return ASON_ERR_SYNTAX; } buf = tmp; }
             switch (c) {
                 case 'n': buf[len++] = '\n'; break;
                 case 'r': buf[len++] = '\r'; break;
@@ -594,7 +598,7 @@ ason_inline ason_err_t ason_parse_quoted_string(const char** pos, const char* en
                 default: buf[len++] = c; break;
             }
         } else {
-            if (len >= cap) { cap = cap * 2; buf = (char*)realloc(buf, cap); }
+            if (len >= cap) { cap = cap * 2; char* tmp = (char*)realloc(buf, cap); if (!tmp) { free(buf); return ASON_ERR_SYNTAX; } buf = tmp; }
             buf[len++] = *p++;
         }
     }
@@ -845,6 +849,70 @@ void ason_write_schema_typed(ason_buf_t* buf, const ason_desc_t* desc);
 ason_buf_t ason_pretty_format(const char* src, size_t len);
 
 /* ============================================================================
+ * ason_free_struct_fields — recursively free all heap-allocated fields
+ * ============================================================================
+ *
+ * Walks a descriptor and frees strings, vecs, maps, and nested structs.
+ * Safe to call on zero-initialized structs (NULL pointers are no-ops).
+ */
+
+static inline void ason_free_struct_fields(void* obj, const ason_desc_t* desc) {
+    for (int i = 0; i < desc->field_count; i++) {
+        const ason_field_t* f = &desc->fields[i];
+        void* fp = (char*)obj + f->offset;
+        switch (f->type) {
+            case ASON_STR: {
+                ason_string_t* s = (ason_string_t*)fp;
+                ason_string_free(s);
+                break;
+            }
+            case ASON_OPT_STR: {
+                ason_opt_str* o = (ason_opt_str*)fp;
+                if (o->has_value) ason_string_free(&o->value);
+                break;
+            }
+            case ASON_VEC_I64: { ason_vec_i64_free((ason_vec_i64*)fp); break; }
+            case ASON_VEC_U64: { ason_vec_u64_free((ason_vec_u64*)fp); break; }
+            case ASON_VEC_F64: { ason_vec_f64_free((ason_vec_f64*)fp); break; }
+            case ASON_VEC_BOOL: { ason_vec_bool_free((ason_vec_bool*)fp); break; }
+            case ASON_VEC_STR: {
+                ason_vec_str* v = (ason_vec_str*)fp;
+                for (size_t j = 0; j < v->len; j++) ason_string_free(&v->data[j]);
+                ason_vec_str_free(v);
+                break;
+            }
+            case ASON_VEC_VEC_I64: {
+                ason_vec_vec_i64* v = (ason_vec_vec_i64*)fp;
+                for (size_t j = 0; j < v->len; j++) ason_vec_i64_free(&v->data[j]);
+                ason_vec_vec_i64_free(v);
+                break;
+            }
+            case ASON_MAP_SI: {
+                ason_map_si* m = (ason_map_si*)fp;
+                for (size_t j = 0; j < m->len; j++) ason_string_free(&m->data[j].key);
+                ason_map_si_free(m);
+                break;
+            }
+            case ASON_MAP_SS: {
+                ason_map_ss* m = (ason_map_ss*)fp;
+                for (size_t j = 0; j < m->len; j++) {
+                    ason_string_free(&m->data[j].key);
+                    ason_string_free(&m->data[j].val);
+                }
+                ason_map_ss_free(m);
+                break;
+            }
+            case ASON_STRUCT: {
+                if (f->sub_desc)
+                    ason_free_struct_fields(fp, (const ason_desc_t*)f->sub_desc);
+                break;
+            }
+            default: break; /* scalars: nothing to free */
+        }
+    }
+}
+
+/* ============================================================================
  * ASON_FIELD macro — build a field descriptor
  * ============================================================================ */
 
@@ -1003,7 +1071,7 @@ ason_buf_t ason_pretty_format(const char* src, size_t len);
             if (i > 0) { \
                 if (*pos == ',') { pos++; ason_skip_ws(&pos, end); if (pos < end && *pos == ')') break; } \
                 else if (*pos == ')') break; \
-                else return ASON_ERR_SYNTAX; \
+                else { ason_free_struct_fields(out, &StructType##_ason_desc); return ASON_ERR_SYNTAX; } \
             } \
             if (field_map[i] >= 0) { \
                 int fi = field_map[i]; \
@@ -1020,7 +1088,7 @@ ason_buf_t ason_pretty_format(const char* src, size_t len);
                     err = StructType##_ason_fields[fi].load_fn(&pos, end, out, \
                         StructType##_ason_fields[fi].offset); \
                 } \
-                if (err != ASON_OK) return err; \
+                if (err != ASON_OK) { ason_free_struct_fields(out, &StructType##_ason_desc); return err; } \
             } else { \
                 ason_skip_value(&pos, end); \
             } \
@@ -1155,7 +1223,12 @@ ason_buf_t ason_pretty_format(const char* src, size_t len);
             pos++; \
             if (cnt >= cap) { \
                 cap = cap + (cap >> 1); \
-                arr = (StructType*)realloc(arr, cap * sizeof(StructType)); \
+                StructType* tmp = (StructType*)realloc(arr, cap * sizeof(StructType)); \
+                if (!tmp) { \
+                    for (size_t k = 0; k < cnt; k++) ason_free_struct_fields(&arr[k], &StructType##_ason_desc); \
+                    free(arr); return ASON_ERR_ALLOC; \
+                } \
+                arr = tmp; \
                 memset(arr + cnt, 0, (cap - cnt) * sizeof(StructType)); \
             } \
             StructType* elem = &arr[cnt]; \
@@ -1166,7 +1239,10 @@ ason_buf_t ason_pretty_format(const char* src, size_t len);
                 if (i > 0) { \
                     if (*pos == ',') { pos++; ason_skip_ws(&pos, end); if (pos < end && *pos == ')') break; } \
                     else if (*pos == ')') break; \
-                    else { free(arr); return ASON_ERR_SYNTAX; } \
+                    else { \
+                        for (size_t k = 0; k <= cnt; k++) ason_free_struct_fields(&arr[k], &StructType##_ason_desc); \
+                        free(arr); return ASON_ERR_SYNTAX; \
+                    } \
                 } \
                 if (field_map[i] >= 0) { \
                     int fi = field_map[i]; \
@@ -1183,7 +1259,10 @@ ason_buf_t ason_pretty_format(const char* src, size_t len);
                         err = StructType##_ason_fields[fi].load_fn(&pos, end, elem, \
                             StructType##_ason_fields[fi].offset); \
                     } \
-                    if (err != ASON_OK) { free(arr); return err; } \
+                    if (err != ASON_OK) { \
+                        for (size_t k = 0; k <= cnt; k++) ason_free_struct_fields(&arr[k], &StructType##_ason_desc); \
+                        free(arr); return err; \
+                    } \
                 } else { \
                     ason_skip_value(&pos, end); \
                 } \
@@ -1240,11 +1319,22 @@ ason_buf_t ason_pretty_format(const char* src, size_t len);
             /* Ensure capacity and load directly into vector slot */ \
             if (v->len >= v->cap) { \
                 v->cap = v->cap ? v->cap * 2 : 4; \
-                v->data = (StructType*)realloc(v->data, v->cap * sizeof(StructType)); \
+                StructType* tmp = (StructType*)realloc(v->data, v->cap * sizeof(StructType)); \
+                if (!tmp) { \
+                    for (size_t k = 0; k < v->len; k++) ason_free_struct_fields(&v->data[k], &StructType##_ason_desc); \
+                    ason_vec_##StructType##_free(v); \
+                    return ASON_ERR_ALLOC; \
+                } \
+                v->data = tmp; \
             } \
             memset(&v->data[v->len], 0, sizeof(StructType)); \
             ason_err_t err = ason_decode_struct(pos, end, &v->data[v->len], &StructType##_ason_desc); \
-            if (err != ASON_OK) return err; \
+            if (err != ASON_OK) { \
+                ason_free_struct_fields(&v->data[v->len], &StructType##_ason_desc); \
+                for (size_t k = 0; k < v->len; k++) ason_free_struct_fields(&v->data[k], &StructType##_ason_desc); \
+                ason_vec_##StructType##_free(v); \
+                return err; \
+            } \
             v->len++; \
         } \
         return ASON_OK; \
@@ -1444,7 +1534,10 @@ ason_err_t ason_bin_decode_struct(const char** pos, const char* end, void* obj, 
         if (!arr) return ASON_ERR_ALLOC; \
         for (uint32_t i = 0; i < count; i++) { \
             err = ason_bin_decode_struct(&pos, end, &arr[i], &StructType##_ason_desc); \
-            if (err != ASON_OK) { free(arr); return err; } \
+            if (err != ASON_OK) { \
+                for (uint32_t k = 0; k <= i; k++) ason_free_struct_fields(&arr[k], &StructType##_ason_desc); \
+                free(arr); return err; \
+            } \
         } \
         *out_arr = arr; \
         *out_count = count; \

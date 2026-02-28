@@ -418,7 +418,7 @@ ason_err_t ason_decode_vec_i64(const char** pos, const char* end, void* base, si
         first = false;
         int64_t val;
         ason_err_t e = load_i64_raw(pos, end, &val);
-        if (e != ASON_OK) return e;
+        if (e != ASON_OK) { ason_vec_i64_free(v); return e; }
         ason_vec_i64_push(v, val);
     }
     return ASON_OK;
@@ -441,7 +441,7 @@ ason_err_t ason_decode_vec_u64(const char** pos, const char* end, void* base, si
         first = false;
         uint64_t val;
         ason_err_t e = load_u64_raw(pos, end, &val);
-        if (e != ASON_OK) return e;
+        if (e != ASON_OK) { ason_vec_u64_free(v); return e; }
         ason_vec_u64_push(v, val);
     }
     return ASON_OK;
@@ -464,7 +464,7 @@ ason_err_t ason_decode_vec_f64(const char** pos, const char* end, void* base, si
         first = false;
         double val;
         ason_err_t e = load_f64_raw(pos, end, &val);
-        if (e != ASON_OK) return e;
+        if (e != ASON_OK) { ason_vec_f64_free(v); return e; }
         ason_vec_f64_push(v, val);
     }
     return ASON_OK;
@@ -487,7 +487,12 @@ ason_err_t ason_decode_vec_str(const char** pos, const char* end, void* base, si
         first = false;
         char* out_str = NULL; size_t out_len = 0; bool allocated = false;
         ason_err_t e = ason_parse_string_value(pos, end, &out_str, &out_len, &allocated);
-        if (e != ASON_OK) return e;
+        if (e != ASON_OK) {
+            /* Free previously pushed strings */
+            for (size_t j = 0; j < v->len; ++j) ason_string_free(&v->data[j]);
+            ason_vec_str_free(v);
+            return e;
+        }
         ason_string_t s;
         if (allocated) {
             s.data = out_str;
@@ -522,7 +527,7 @@ ason_err_t ason_decode_vec_bool(const char** pos, const char* end, void* base, s
             ason_vec_bool_push(v, true); *pos += 4;
         } else if (*pos + 5 <= end && memcmp(*pos, "false", 5) == 0) {
             ason_vec_bool_push(v, false); *pos += 5;
-        } else return ASON_ERR_SYNTAX;
+        } else { ason_vec_bool_free(v); return ASON_ERR_SYNTAX; }
     }
     return ASON_OK;
 }
@@ -542,7 +547,10 @@ ason_err_t ason_decode_vec_vec_i64(const char** pos, const char* end, void* base
             else break;
         }
         first = false;
-        if (*pos >= end || **pos != '[') return ASON_ERR_SYNTAX;
+        if (*pos >= end || **pos != '[') {
+            for (size_t j = 0; j < v->len; ++j) ason_vec_i64_free(&v->data[j]);
+            ason_vec_vec_i64_free(v); return ASON_ERR_SYNTAX;
+        }
         (*pos)++;
         ason_vec_i64 inner = ason_vec_i64_new();
         bool ifirst = true;
@@ -556,7 +564,12 @@ ason_err_t ason_decode_vec_vec_i64(const char** pos, const char* end, void* base
             ifirst = false;
             int64_t val;
             ason_err_t e = load_i64_raw(pos, end, &val);
-            if (e != ASON_OK) return e;
+            if (e != ASON_OK) {
+                ason_vec_i64_free(&inner);
+                for (size_t j = 0; j < v->len; ++j) ason_vec_i64_free(&v->data[j]);
+                ason_vec_vec_i64_free(v);
+                return e;
+            }
             ason_vec_i64_push(&inner, val);
         }
         ason_vec_vec_i64_push(v, inner);
@@ -579,18 +592,28 @@ ason_err_t ason_decode_map_si(const char** pos, const char* end, void* base, siz
             else break;
         }
         first = false;
-        if (*pos >= end || **pos != '(') return ASON_ERR_SYNTAX;
+        if (*pos >= end || **pos != '(') {
+            for (size_t j = 0; j < m->len; ++j) ason_string_free(&m->data[j].key);
+            ason_map_si_free(m); return ASON_ERR_SYNTAX;
+        }
         (*pos)++;
         /* key */
         char* kstr = NULL; size_t klen = 0; bool kall = false;
         ason_err_t e = ason_parse_string_value(pos, end, &kstr, &klen, &kall);
-        if (e != ASON_OK) return e;
+        if (e != ASON_OK) {
+            for (size_t j = 0; j < m->len; ++j) ason_string_free(&m->data[j].key);
+            ason_map_si_free(m); return e;
+        }
         ason_skip_ws(pos, end);
         if (*pos < end && **pos == ',') (*pos)++;
         /* value */
         int64_t val;
         e = load_i64_raw(pos, end, &val);
-        if (e != ASON_OK) return e;
+        if (e != ASON_OK) {
+            if (kall) free(kstr);
+            for (size_t j = 0; j < m->len; ++j) ason_string_free(&m->data[j].key);
+            ason_map_si_free(m); return e;
+        }
         ason_skip_ws(pos, end);
         if (*pos < end && **pos == ')') (*pos)++;
         ason_map_si_entry_t entry;
@@ -624,18 +647,28 @@ ason_err_t ason_decode_map_ss(const char** pos, const char* end, void* base, siz
             else break;
         }
         first = false;
-        if (*pos >= end || **pos != '(') return ASON_ERR_SYNTAX;
+        if (*pos >= end || **pos != '(') {
+            for (size_t j = 0; j < m->len; ++j) { ason_string_free(&m->data[j].key); ason_string_free(&m->data[j].val); }
+            ason_map_ss_free(m); return ASON_ERR_SYNTAX;
+        }
         (*pos)++;
         /* key */
         char* kstr = NULL; size_t klen = 0; bool kall = false;
         ason_err_t e = ason_parse_string_value(pos, end, &kstr, &klen, &kall);
-        if (e != ASON_OK) return e;
+        if (e != ASON_OK) {
+            for (size_t j = 0; j < m->len; ++j) { ason_string_free(&m->data[j].key); ason_string_free(&m->data[j].val); }
+            ason_map_ss_free(m); return e;
+        }
         ason_skip_ws(pos, end);
         if (*pos < end && **pos == ',') (*pos)++;
         /* value */
         char* vstr = NULL; size_t vlen = 0; bool vall = false;
         e = ason_parse_string_value(pos, end, &vstr, &vlen, &vall);
-        if (e != ASON_OK) return e;
+        if (e != ASON_OK) {
+            if (kall) free(kstr);
+            for (size_t j = 0; j < m->len; ++j) { ason_string_free(&m->data[j].key); ason_string_free(&m->data[j].val); }
+            ason_map_ss_free(m); return e;
+        }
         ason_skip_ws(pos, end);
         if (*pos < end && **pos == ')') (*pos)++;
         ason_map_ss_entry_t entry;
@@ -942,7 +975,7 @@ ason_err_t ason_decode_struct(const char** pos, const char* end, void* obj, cons
             if (i > 0) {
                 if (**pos == ',') { (*pos)++; ason_skip_ws(pos, end); if (*pos < end && **pos == ')') break; }
                 else if (**pos == ')') break;
-                else return ASON_ERR_SYNTAX;
+                else { ason_free_struct_fields(obj, desc); return ASON_ERR_SYNTAX; }
             }
             if (field_map[i] >= 0) {
                 const ason_field_t* f = &desc->fields[field_map[i]];
@@ -956,7 +989,7 @@ ason_err_t ason_decode_struct(const char** pos, const char* end, void* obj, cons
                 } else {
                     err = f->load_fn(pos, end, obj, f->offset);
                 }
-                if (err != ASON_OK) return err;
+                if (err != ASON_OK) { ason_free_struct_fields(obj, desc); return err; }
             } else {
                 ason_skip_value(pos, end);
             }
@@ -976,7 +1009,7 @@ ason_err_t ason_decode_struct(const char** pos, const char* end, void* obj, cons
             if (i > 0) {
                 if (**pos == ',') { (*pos)++; ason_skip_ws(pos, end); if (*pos < end && **pos == ')') break; }
                 else if (**pos == ')') break;
-                else return ASON_ERR_SYNTAX;
+                else { ason_free_struct_fields(obj, desc); return ASON_ERR_SYNTAX; }
             }
             const ason_field_t* f = &desc->fields[i];
             ason_err_t err;
@@ -990,7 +1023,7 @@ ason_err_t ason_decode_struct(const char** pos, const char* end, void* obj, cons
             } else {
                 err = f->load_fn(pos, end, obj, f->offset);
             }
-            if (err != ASON_OK) return err;
+            if (err != ASON_OK) { ason_free_struct_fields(obj, desc); return err; }
         }
         ason_skip_remaining_tuple_values(pos, end);
         ason_skip_ws(pos, end);
@@ -1178,10 +1211,11 @@ ason_err_t ason_bin_decode_vec_str(const char** pos, const char* end, void* base
     if (!arr && n) return ASON_ERR_ALLOC;
     for (uint32_t i = 0; i < n; i++) {
         uint32_t slen;
-        e = ason_bin_read_u32(pos, end, &slen); if (e) { free(arr); return e; }
-        if ((size_t)(end - *pos) < slen) { free(arr); return ASON_ERR_BUFFER_OVERFLOW; }
+        e = ason_bin_read_u32(pos, end, &slen);
+        if (e) { for (uint32_t j = 0; j < i; j++) free(arr[j].data); free(arr); return e; }
+        if ((size_t)(end - *pos) < slen) { for (uint32_t j = 0; j < i; j++) free(arr[j].data); free(arr); return ASON_ERR_BUFFER_OVERFLOW; }
         char* sbuf = (char*)malloc(slen + 1);
-        if (!sbuf && slen) { free(arr); return ASON_ERR_ALLOC; }
+        if (!sbuf && slen) { for (uint32_t j = 0; j < i; j++) free(arr[j].data); free(arr); return ASON_ERR_ALLOC; }
         if (slen) memcpy(sbuf, *pos, slen);
         if (sbuf) sbuf[slen] = '\0';
         *pos += slen;
@@ -1268,7 +1302,7 @@ ason_err_t ason_bin_decode_struct(const char** pos, const char* end,
                                   void* obj, const ason_desc_t* desc) {
     for (int i = 0; i < desc->field_count; i++) {
         ason_err_t e = ason_bin_select_load(pos, end, &desc->fields[i], obj);
-        if (e != ASON_OK) return e;
+        if (e != ASON_OK) { ason_free_struct_fields(obj, desc); return e; }
     }
     return ASON_OK;
 }

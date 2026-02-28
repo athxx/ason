@@ -546,20 +546,25 @@ static PyObject* decode_tuple(const char*& p, const char* end, const CachedSchem
     PyObject* rec = _PyDict_NewPresized((Py_ssize_t)sc.fields.size());
     if (!rec) throw std::bad_alloc();
 
-    for (size_t i = 0; i < sc.fields.size(); ++i) {
-        if (i) {
-            skip_ws(p, end);
-            if (p >= end || *p != ',') { Py_DECREF(rec); ason_throw("expected ','"); }
-            ++p;
+    try {
+        for (size_t i = 0; i < sc.fields.size(); ++i) {
+            if (i) {
+                skip_ws(p, end);
+                if (p >= end || *p != ',') ason_throw("expected ','");
+                ++p;
+            }
+            PyObject* val = decode_value(p, end, sc.fields[i].type, tmp);
+            if (!val) throw py::error_already_set();
+            PyDict_SetItem(rec, sc.fields[i].key, val);
+            Py_DECREF(val);  // dict now owns it
         }
-        PyObject* val = decode_value(p, end, sc.fields[i].type, tmp);
-        if (!val) { Py_DECREF(rec); throw py::error_already_set(); }
-        PyDict_SetItem(rec, sc.fields[i].key, val);
-        Py_DECREF(val);  // dict now owns it
+        skip_ws(p, end);
+        if (p >= end || *p != ')') ason_throw("expected ')'");
+        ++p;
+    } catch (...) {
+        Py_DECREF(rec);
+        throw;
     }
-    skip_ws(p, end);
-    if (p >= end || *p != ')') { Py_DECREF(rec); ason_throw("expected ')'"); }
-    ++p;
     return rec;
 }
 
@@ -590,11 +595,16 @@ static py::object ason_decode(const std::string& text) {
     if (schema.is_slice) {
         std::vector<PyObject*> rows;
         rows.reserve(64);
-        while (true) {
-            while (p < end && ((unsigned char)*p <= ' ' || *p == ',')) ++p;
-            if (p >= end || *p != '(') break;
-            PyObject* rec = decode_tuple(p, end, schema, tmp);
-            rows.push_back(rec);
+        try {
+            while (true) {
+                while (p < end && ((unsigned char)*p <= ' ' || *p == ',')) ++p;
+                if (p >= end || *p != '(') break;
+                PyObject* rec = decode_tuple(p, end, schema, tmp);
+                rows.push_back(rec);
+            }
+        } catch (...) {
+            for (auto* r : rows) Py_DECREF(r);
+            throw;
         }
         PyObject* lst = PyList_New((Py_ssize_t)rows.size());
         if (!lst) { for (auto* r : rows) Py_DECREF(r); throw std::bad_alloc(); }
@@ -689,29 +699,39 @@ static py::object ason_decode_binary(py::bytes data, const std::string& schema_s
 
     if (sc.is_slice) {
         uint32_t count = read_le32(p, end);
-        PyObject* lst = PyList_New((Py_ssize_t)count);
-        if (!lst) throw std::bad_alloc();
+        py::object lst = py::reinterpret_steal<py::object>(PyList_New((Py_ssize_t)count));
+        if (!lst.ptr()) throw std::bad_alloc();
         for (uint32_t i = 0; i < count; ++i) {
             PyObject* rec = _PyDict_NewPresized((Py_ssize_t)sc.fields.size());
-            if (!rec) { Py_DECREF(lst); throw std::bad_alloc(); }
+            if (!rec) throw std::bad_alloc();
+            try {
+                for (auto& f : sc.fields) {
+                    PyObject* val = decode_bin_field(p, end, f.type);
+                    PyDict_SetItem(rec, f.key, val);
+                    Py_DECREF(val);
+                }
+            } catch (...) {
+                Py_DECREF(rec);
+                throw;
+            }
+            PyList_SET_ITEM(lst.ptr(), (Py_ssize_t)i, rec);  // steals ref
+        }
+        if (p != end) ason_throw("trailing binary data");
+        return lst;
+    } else {
+        PyObject* rec = _PyDict_NewPresized((Py_ssize_t)sc.fields.size());
+        if (!rec) throw std::bad_alloc();
+        try {
             for (auto& f : sc.fields) {
                 PyObject* val = decode_bin_field(p, end, f.type);
                 PyDict_SetItem(rec, f.key, val);
                 Py_DECREF(val);
             }
-            PyList_SET_ITEM(lst, (Py_ssize_t)i, rec);  // steals ref
+            if (p != end) ason_throw("trailing binary data");
+        } catch (...) {
+            Py_DECREF(rec);
+            throw;
         }
-        if (p != end) { Py_DECREF(lst); ason_throw("trailing binary data"); }
-        return py::reinterpret_steal<py::object>(lst);
-    } else {
-        PyObject* rec = _PyDict_NewPresized((Py_ssize_t)sc.fields.size());
-        if (!rec) throw std::bad_alloc();
-        for (auto& f : sc.fields) {
-            PyObject* val = decode_bin_field(p, end, f.type);
-            PyDict_SetItem(rec, f.key, val);
-            Py_DECREF(val);
-        }
-        if (p != end) { Py_DECREF(rec); ason_throw("trailing binary data"); }
         return py::reinterpret_steal<py::object>(rec);
     }
 }

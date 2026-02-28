@@ -918,6 +918,109 @@ fn SliceChild(comptime T: type) type {
     return @typeInfo(T).pointer.child;
 }
 
+// ============================================================================
+// Memory cleanup for decoded values
+// ============================================================================
+
+/// Free all heap-allocated memory in a decoded ASON value.
+/// Works for structs and slices of structs returned by `decode`/`decodeBinary`/`jsonDecode`.
+/// Safe to call on zero-initialized values (len=0 slices are no-ops).
+pub fn freeDecoded(comptime T: type, value: T, allocator: Allocator) void {
+    const info = @typeInfo(T);
+    switch (info) {
+        .@"struct" => {
+            freeStructFields(T, &value, allocator);
+        },
+        .pointer => |ptr| {
+            if (ptr.size == .slice) {
+                if (@typeInfo(ptr.child) == .@"struct") {
+                    for (value) |*item| {
+                        freeStructFields(ptr.child, item, allocator);
+                    }
+                } else if (ptr.child == []const u8 or ptr.child == []u8) {
+                    for (value) |item| {
+                        if (item.len > 0) allocator.free(item);
+                    }
+                } else if (comptime isSliceOfSlice(ptr.child)) {
+                    for (value) |item| {
+                        if (item.len > 0) allocator.free(item);
+                    }
+                }
+                if (value.len > 0) allocator.free(value);
+            }
+        },
+        else => {},
+    }
+}
+
+fn isSliceOfSlice(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info != .pointer) return false;
+    return info.pointer.size == .slice;
+}
+
+fn isOptionalString(comptime T: type) bool {
+    if (@typeInfo(T) != .optional) return false;
+    const Child = @typeInfo(T).optional.child;
+    return Child == []const u8 or Child == []u8;
+}
+
+fn freeStructFields(comptime T: type, value: *const T, allocator: Allocator) void {
+    const s = @typeInfo(T).@"struct";
+    inline for (s.fields) |field| {
+        const FT = field.type;
+        if (FT == []const u8 or FT == []u8) {
+            const slice = @field(value, field.name);
+            if (slice.len > 0) allocator.free(slice);
+        } else if (comptime isOptionalString(FT)) {
+            if (@field(value, field.name)) |slice| {
+                if (slice.len > 0) allocator.free(slice);
+            }
+        } else if (comptime @typeInfo(FT) == .pointer and @typeInfo(FT).pointer.size == .slice) {
+            const slice = @field(value, field.name);
+            const Child = @typeInfo(FT).pointer.child;
+            if (@typeInfo(Child) == .@"struct") {
+                for (slice) |*item| {
+                    freeStructFields(Child, item, allocator);
+                }
+            } else if (Child == []const u8 or Child == []u8) {
+                for (slice) |item| {
+                    if (item.len > 0) allocator.free(item);
+                }
+            } else if (comptime isSliceOfSlice(Child)) {
+                for (slice) |item| {
+                    if (item.len > 0) allocator.free(item);
+                }
+            }
+            if (slice.len > 0) allocator.free(slice);
+        } else if (@typeInfo(FT) == .@"struct") {
+            freeStructFields(FT, &@field(value, field.name), allocator);
+        } else if (@typeInfo(FT) == .optional) {
+            const OptChild = @typeInfo(FT).optional.child;
+            if (@typeInfo(OptChild) == .@"struct") {
+                if (@field(value, field.name)) |*v| {
+                    freeStructFields(OptChild, v, allocator);
+                }
+            } else if (OptChild == []const u8 or OptChild == []u8) {
+                if (@field(value, field.name)) |slice| {
+                    if (slice.len > 0) allocator.free(slice);
+                }
+            }
+        }
+    }
+}
+
+/// Free a single array element's allocations (used in errdefer for parseArray).
+fn freeArrayItem(comptime T: type, item: *const T, allocator: Allocator) void {
+    if (T == []const u8 or T == []u8) {
+        if (item.len > 0) allocator.free(item.*);
+    } else if (@typeInfo(T) == .@"struct") {
+        freeStructFields(T, item, allocator);
+    } else if (comptime @typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .slice) {
+        if (item.len > 0) allocator.free(item.*);
+    }
+}
+
 fn isStructSlice(comptime T: type) bool {
     const info = @typeInfo(T);
     if (info != .pointer) return false;
@@ -980,7 +1083,12 @@ pub fn decode(comptime T: type, input: []const u8, allocator: Allocator) !T {
         parser.skipWhitespaceAndComments();
 
         var results: std.ArrayList(E) = .{};
-        errdefer results.deinit(allocator);
+        errdefer {
+            for (results.items) |*item| {
+                freeStructFields(E, item, allocator);
+            }
+            results.deinit(allocator);
+        }
 
         while (parser.pos < parser.input.len) {
             parser.skipWhitespaceAndComments();
@@ -1019,6 +1127,7 @@ pub fn decode(comptime T: type, input: []const u8, allocator: Allocator) !T {
             try parser.parseStructWithSchema(T, schema_buf[0..schema_count])
         else
             try parser.parseStruct(T);
+        errdefer freeStructFields(T, &result, allocator);
         parser.skipWhitespaceAndComments();
         if (parser.pos < parser.input.len) return error.TrailingCharacters;
         return result;
@@ -1144,7 +1253,8 @@ const Parser = struct {
                 self.skipWhitespaceAndComments();
                 if ((try self.peekByte()) != '(') return error.ExpectedOpenParen;
                 self.pos += 1;
-                var result: T = undefined;
+                var result: T = std.mem.zeroes(T);
+                errdefer freeStructFields(T, &result, self.allocator);
                 inline for (s.fields, 0..) |field, i| {
                     if (i > 0) {
                         self.skipWhitespaceAndComments();
@@ -1349,7 +1459,12 @@ const Parser = struct {
         self.pos += 1;
 
         var result: std.ArrayList(Child) = .{};
-        errdefer result.deinit(self.allocator);
+        errdefer {
+            for (result.items) |*item| {
+                freeArrayItem(Child, item, self.allocator);
+            }
+            result.deinit(self.allocator);
+        }
 
         self.skipWhitespaceAndComments();
         if (self.pos < self.input.len and self.input[self.pos] == ']') {
@@ -1518,6 +1633,8 @@ const Parser = struct {
             }
         }
 
+        errdefer freeStructFields(T, &result, self.allocator);
+
         // Read values positionally according to schema, match by name
         for (schema, 0..) |sf, si| {
             if (si > 0) {
@@ -1584,7 +1701,12 @@ const Parser = struct {
         self.pos += 1;
 
         var result: std.ArrayList(E) = .{};
-        errdefer result.deinit(self.allocator);
+        errdefer {
+            for (result.items) |*item| {
+                freeStructFields(E, item, self.allocator);
+            }
+            result.deinit(self.allocator);
+        }
 
         self.skipWhitespaceAndComments();
         if (self.pos < self.input.len and self.input[self.pos] == ']') {
@@ -1763,7 +1885,12 @@ pub fn decodeBinary(comptime T: type, data: []const u8, allocator: Allocator) !T
         const E = @typeInfo(T).pointer.child;
         const count = try reader.readU32();
         var result = try std.ArrayList(E).initCapacity(allocator, count);
-        errdefer result.deinit(allocator);
+        errdefer {
+            for (result.items) |*item| {
+                freeStructFields(E, item, allocator);
+            }
+            result.deinit(allocator);
+        }
         for (0..count) |_| {
             try result.append(allocator, try reader.readValue(E));
         }
@@ -1901,8 +2028,14 @@ const BinReader = struct {
                         return res;
                     }
                     const res = try self.allocator.alloc(ptr.child, count);
+                    errdefer self.allocator.free(res);
+                    var filled: usize = 0;
+                    errdefer for (res[0..filled]) |*item| {
+                        freeArrayItem(ptr.child, item, self.allocator);
+                    };
                     for (0..count) |i| {
                         res[i] = try self.readValue(ptr.child);
+                        filled = i + 1;
                     }
                     return res;
                 } else {
@@ -1915,7 +2048,8 @@ const BinReader = struct {
                 return try self.readValue(opt.child);
             },
             .@"struct" => |s| {
-                var result: T = undefined;
+                var result: T = std.mem.zeroes(T);
+                errdefer freeStructFields(T, &result, self.allocator);
                 inline for (s.fields) |field| {
                     @field(result, field.name) = try self.readValue(field.type);
                 }
@@ -2184,7 +2318,12 @@ const JsonParser = struct {
         if (self.pos >= self.input.len or self.input[self.pos] != '[') return error.InvalidFormat;
         self.pos += 1;
         var result: std.ArrayList(Child) = .{};
-        errdefer result.deinit(self.allocator);
+        errdefer {
+            for (result.items) |*item| {
+                freeArrayItem(Child, item, self.allocator);
+            }
+            result.deinit(self.allocator);
+        }
         self.skipWs();
         if (self.pos < self.input.len and self.input[self.pos] == ']') {
             self.pos += 1;
@@ -2212,7 +2351,8 @@ const JsonParser = struct {
         self.skipWs();
         if (self.pos >= self.input.len or self.input[self.pos] != '{') return error.InvalidFormat;
         self.pos += 1;
-        var result: T = undefined;
+        var result: T = std.mem.zeroes(T);
+        errdefer freeStructFields(T, &result, self.allocator);
         inline for (s.fields) |field| {
             if (@typeInfo(field.type) == .optional) {
                 @field(result, field.name) = null;
