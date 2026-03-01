@@ -6,6 +6,53 @@
 #include "ason.h"
 
 /* ============================================================================
+ * Thread-local pool + decode-path allocation wrappers
+ * ============================================================================ */
+
+#if defined(_MSC_VER)
+  static __declspec(thread) ason_pool_t* ason__pool = NULL;
+#elif defined(__GNUC__) || defined(__clang__)
+  static __thread ason_pool_t* ason__pool = NULL;
+#else
+  static _Thread_local ason_pool_t* ason__pool = NULL;
+#endif
+
+void ason__set_pool(ason_pool_t* p) { ason__pool = p; }
+
+void* ason__get_pool(void) { return (void*)ason__pool; }
+
+void* ason__alloc(size_t size) {
+    if (ason__pool) return ason_pool_alloc(ason__pool, size);
+    return malloc(size);
+}
+
+void* ason__calloc(size_t n, size_t sz) {
+    if (ason__pool) {
+        size_t total = n * sz;
+        void* p = ason_pool_alloc(ason__pool, total);
+        if (p) memset(p, 0, total);
+        return p;
+    }
+    return calloc(n, sz);
+}
+
+void* ason__realloc(void* ptr, size_t old_size, size_t new_size) {
+    if (ason__pool) {
+        void* p = ason_pool_alloc(ason__pool, new_size);
+        if (p && ptr && old_size > 0)
+            memcpy(p, ptr, old_size < new_size ? old_size : new_size);
+        return p;
+    }
+    (void)old_size;
+    return realloc(ptr, new_size);
+}
+
+void ason__free(void* ptr) {
+    if (!ason__pool) free(ptr);
+    /* Pool mode: no-op — freed when pool is destroyed */
+}
+
+/* ============================================================================
  * Dump functions
  * ============================================================================ */
 
@@ -325,7 +372,7 @@ ason_err_t ason_decode_char(const char** pos, const char* end, void* base, size_
     ason_err_t err = ason_parse_string_value(pos, end, &out_str, &out_len, &allocated);
     if (err != ASON_OK) return err;
     *(char*)((char*)base + offset) = (out_len > 0) ? out_str[0] : '\0';
-    if (allocated) free(out_str);
+    if (allocated) ason__free(out_str);
     return ASON_OK;
 }
 
@@ -347,7 +394,7 @@ ason_err_t ason_decode_str(const char** pos, const char* end, void* base, size_t
         s->len = out_len;
     } else {
         /* Make an owned copy of zero-copy result */
-        s->data = (char*)malloc(out_len + 1);
+        s->data = (char*)ason__alloc(out_len + 1);
         memcpy(s->data, out_str, out_len);
         s->data[out_len] = '\0';
         s->len = out_len;
@@ -382,7 +429,7 @@ ason_err_t ason_decode_opt_str(const char** pos, const char* end, void* base, si
         opt->value.data = out_str;
         opt->value.len = out_len;
     } else {
-        opt->value.data = (char*)malloc(out_len + 1);
+        opt->value.data = (char*)ason__alloc(out_len + 1);
         memcpy(opt->value.data, out_str, out_len);
         opt->value.data[out_len] = '\0';
         opt->value.len = out_len;
@@ -498,7 +545,7 @@ ason_err_t ason_decode_vec_str(const char** pos, const char* end, void* base, si
             s.data = out_str;
             s.len = out_len;
         } else {
-            s.data = (char*)malloc(out_len + 1);
+            s.data = (char*)ason__alloc(out_len + 1);
             memcpy(s.data, out_str, out_len);
             s.data[out_len] = '\0';
             s.len = out_len;
@@ -610,7 +657,7 @@ ason_err_t ason_decode_map_si(const char** pos, const char* end, void* base, siz
         int64_t val;
         e = load_i64_raw(pos, end, &val);
         if (e != ASON_OK) {
-            if (kall) free(kstr);
+            if (kall) ason__free(kstr);
             for (size_t j = 0; j < m->len; ++j) ason_string_free(&m->data[j].key);
             ason_map_si_free(m); return e;
         }
@@ -621,7 +668,7 @@ ason_err_t ason_decode_map_si(const char** pos, const char* end, void* base, siz
             entry.key.data = kstr;
             entry.key.len = klen;
         } else {
-            entry.key.data = (char*)malloc(klen + 1);
+            entry.key.data = (char*)ason__alloc(klen + 1);
             memcpy(entry.key.data, kstr, klen);
             entry.key.data[klen] = '\0';
             entry.key.len = klen;
@@ -665,7 +712,7 @@ ason_err_t ason_decode_map_ss(const char** pos, const char* end, void* base, siz
         char* vstr = NULL; size_t vlen = 0; bool vall = false;
         e = ason_parse_string_value(pos, end, &vstr, &vlen, &vall);
         if (e != ASON_OK) {
-            if (kall) free(kstr);
+            if (kall) ason__free(kstr);
             for (size_t j = 0; j < m->len; ++j) { ason_string_free(&m->data[j].key); ason_string_free(&m->data[j].val); }
             ason_map_ss_free(m); return e;
         }
@@ -676,14 +723,14 @@ ason_err_t ason_decode_map_ss(const char** pos, const char* end, void* base, siz
             entry.key.data = kstr;
             entry.key.len = klen;
         } else {
-            entry.key.data = (char*)malloc(klen + 1);
+            entry.key.data = (char*)ason__alloc(klen + 1);
             memcpy(entry.key.data, kstr, klen); entry.key.data[klen] = '\0'; entry.key.len = klen;
         }
         if (vall) {
             entry.val.data = vstr;
             entry.val.len = vlen;
         } else {
-            entry.val.data = (char*)malloc(vlen + 1);
+            entry.val.data = (char*)ason__alloc(vlen + 1);
             memcpy(entry.val.data, vstr, vlen); entry.val.data[vlen] = '\0'; entry.val.len = vlen;
         }
         ason_map_ss_push(m, entry);
@@ -1170,7 +1217,7 @@ ason_err_t ason_bin_decode_str(const char** pos, const char* end, void* base, si
     ason_err_t e = ason_bin_read_u32(pos, end, &len);
     if (e) return e;
     if ((size_t)(end - *pos) < len) return ASON_ERR_BUFFER_OVERFLOW;
-    char* buf = (char*)malloc(len + 1);
+    char* buf = (char*)ason__alloc(len + 1);
     if (!buf) return ASON_ERR_ALLOC;
     if (len) memcpy(buf, *pos, len);
     buf[len] = '\0';
@@ -1184,7 +1231,7 @@ ason_err_t ason_bin_decode_str(const char** pos, const char* end, void* base, si
 ason_err_t ason_bin_decode_vec_i64(const char** pos, const char* end, void* base, size_t off) {
     uint32_t n; ason_err_t e = ason_bin_read_u32(pos, end, &n); if (e) return e;
     if ((size_t)(end - *pos) < (size_t)n * 8) return ASON_ERR_BUFFER_OVERFLOW;
-    int64_t* arr = (int64_t*)malloc((size_t)n * sizeof(int64_t));
+    int64_t* arr = (int64_t*)ason__alloc((size_t)n * sizeof(int64_t));
     if (!arr && n) return ASON_ERR_ALLOC;
     memcpy(arr, *pos, (size_t)n * 8); *pos += (size_t)n * 8;
     ason_vec_i64 v = {arr, n, n}; memcpy((char*)base + off, &v, sizeof(v)); return ASON_OK;
@@ -1192,7 +1239,7 @@ ason_err_t ason_bin_decode_vec_i64(const char** pos, const char* end, void* base
 ason_err_t ason_bin_decode_vec_u64(const char** pos, const char* end, void* base, size_t off) {
     uint32_t n; ason_err_t e = ason_bin_read_u32(pos, end, &n); if (e) return e;
     if ((size_t)(end - *pos) < (size_t)n * 8) return ASON_ERR_BUFFER_OVERFLOW;
-    uint64_t* arr = (uint64_t*)malloc((size_t)n * sizeof(uint64_t));
+    uint64_t* arr = (uint64_t*)ason__alloc((size_t)n * sizeof(uint64_t));
     if (!arr && n) return ASON_ERR_ALLOC;
     memcpy(arr, *pos, (size_t)n * 8); *pos += (size_t)n * 8;
     ason_vec_u64 v = {arr, n, n}; memcpy((char*)base + off, &v, sizeof(v)); return ASON_OK;
@@ -1200,22 +1247,22 @@ ason_err_t ason_bin_decode_vec_u64(const char** pos, const char* end, void* base
 ason_err_t ason_bin_decode_vec_f64(const char** pos, const char* end, void* base, size_t off) {
     uint32_t n; ason_err_t e = ason_bin_read_u32(pos, end, &n); if (e) return e;
     if ((size_t)(end - *pos) < (size_t)n * 8) return ASON_ERR_BUFFER_OVERFLOW;
-    double* arr = (double*)malloc((size_t)n * sizeof(double));
+    double* arr = (double*)ason__alloc((size_t)n * sizeof(double));
     if (!arr && n) return ASON_ERR_ALLOC;
     memcpy(arr, *pos, (size_t)n * 8); *pos += (size_t)n * 8;
     ason_vec_f64 v = {arr, n, n}; memcpy((char*)base + off, &v, sizeof(v)); return ASON_OK;
 }
 ason_err_t ason_bin_decode_vec_str(const char** pos, const char* end, void* base, size_t off) {
     uint32_t n; ason_err_t e = ason_bin_read_u32(pos, end, &n); if (e) return e;
-    ason_string_t* arr = (ason_string_t*)malloc((size_t)n * sizeof(ason_string_t));
+    ason_string_t* arr = (ason_string_t*)ason__alloc((size_t)n * sizeof(ason_string_t));
     if (!arr && n) return ASON_ERR_ALLOC;
     for (uint32_t i = 0; i < n; i++) {
         uint32_t slen;
         e = ason_bin_read_u32(pos, end, &slen);
-        if (e) { for (uint32_t j = 0; j < i; j++) free(arr[j].data); free(arr); return e; }
-        if ((size_t)(end - *pos) < slen) { for (uint32_t j = 0; j < i; j++) free(arr[j].data); free(arr); return ASON_ERR_BUFFER_OVERFLOW; }
-        char* sbuf = (char*)malloc(slen + 1);
-        if (!sbuf && slen) { for (uint32_t j = 0; j < i; j++) free(arr[j].data); free(arr); return ASON_ERR_ALLOC; }
+        if (e) { for (uint32_t j = 0; j < i; j++) ason__free(arr[j].data); ason__free(arr); return e; }
+        if ((size_t)(end - *pos) < slen) { for (uint32_t j = 0; j < i; j++) ason__free(arr[j].data); ason__free(arr); return ASON_ERR_BUFFER_OVERFLOW; }
+        char* sbuf = (char*)ason__alloc(slen + 1);
+        if (!sbuf && slen) { for (uint32_t j = 0; j < i; j++) ason__free(arr[j].data); ason__free(arr); return ASON_ERR_ALLOC; }
         if (slen) memcpy(sbuf, *pos, slen);
         if (sbuf) sbuf[slen] = '\0';
         *pos += slen;
@@ -1226,10 +1273,10 @@ ason_err_t ason_bin_decode_vec_str(const char** pos, const char* end, void* base
 }
 ason_err_t ason_bin_decode_vec_bool(const char** pos, const char* end, void* base, size_t off) {
     uint32_t n; ason_err_t e = ason_bin_read_u32(pos, end, &n); if (e) return e;
-    bool* arr = (bool*)malloc((size_t)n * sizeof(bool));
+    bool* arr = (bool*)ason__alloc((size_t)n * sizeof(bool));
     if (!arr && n) return ASON_ERR_ALLOC;
     for (uint32_t i = 0; i < n; i++) {
-        uint8_t b; e = ason_bin_read_u8(pos, end, &b); if (e) { free(arr); return e; }
+        uint8_t b; e = ason_bin_read_u8(pos, end, &b); if (e) { ason__free(arr); return e; }
         arr[i] = b != 0;
     }
     ason_vec_bool v = {arr, n, n}; memcpy((char*)base + off, &v, sizeof(v)); return ASON_OK;

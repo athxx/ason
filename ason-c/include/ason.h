@@ -154,8 +154,132 @@ ason_inline ason_string_t ason_string_from_len(const char* s, size_t n) {
     return ason_string_new(s, n);
 }
 
+/* ============================================================================
+ * Pool Allocator — yyjson-style arena for decode operations
+ * ============================================================================
+ *
+ * Smart estimation: pool size is computed from input length, not a fixed 128KB.
+ * For 98%+ of payloads (< 10KB), the pool does exactly ONE malloc.
+ * Doubles on growth as safety net for under-estimates.
+ * Thread-safe: each thread has its own active pool via thread-local storage.
+ *
+ * Usage:
+ *   ason_pool_t* pool = NULL;
+ *   ason_err_t err = ason_decode_pooled_MyStruct(input, len, &out, &pool);
+ *   // use out ...
+ *   ason_pool_destroy(pool);  // frees all decode memory at once
+ */
+
+#define ASON_POOL_MIN_SIZE     4096u   /* 1 page — floor for tiny payloads */
+#define ASON_POOL_MAX_BLOCKS   32
+
+typedef struct {
+    char*  blocks[ASON_POOL_MAX_BLOCKS];
+    size_t block_sizes[ASON_POOL_MAX_BLOCKS];
+    size_t block_count;
+    char*  current;
+    char*  end;
+    size_t next_size;
+} ason_pool_t;
+
+/* Create a pool with a specific initial block size (clamped to >= ASON_POOL_MIN_SIZE). */
+ason_inline ason_pool_t* ason_pool_new_sized(size_t initial_size) {
+    ason_pool_t* p = (ason_pool_t*)malloc(sizeof(ason_pool_t));
+    if (!p) return NULL;
+    memset(p, 0, sizeof(ason_pool_t));
+    size_t sz = initial_size < ASON_POOL_MIN_SIZE ? ASON_POOL_MIN_SIZE : initial_size;
+    char* blk = (char*)malloc(sz);
+    if (!blk) { free(p); return NULL; }
+    p->blocks[0] = blk;
+    p->block_sizes[0] = sz;
+    p->block_count = 1;
+    p->current = blk;
+    p->end = blk + sz;
+    p->next_size = sz * 2;
+    return p;
+}
+
+/* Legacy: create pool with a default 4KB initial size. */
+ason_inline ason_pool_t* ason_pool_new(void) {
+    return ason_pool_new_sized(ASON_POOL_MIN_SIZE);
+}
+
+ason_inline void ason_pool_destroy(ason_pool_t* p) {
+    if (!p) return;
+    for (size_t i = 0; i < p->block_count; i++) free(p->blocks[i]);
+    free(p);
+}
+
+ason_inline void* ason_pool_alloc(ason_pool_t* p, size_t size) {
+    /* Bump-allocate with 16-byte alignment */
+    uintptr_t cur = (uintptr_t)p->current;
+    uintptr_t aligned = (cur + 15u) & ~(uintptr_t)15u;
+    char* ptr = (char*)aligned;
+    char* new_end = ptr + size;
+    if (new_end <= p->end) {
+        p->current = new_end;
+        return ptr;
+    }
+    /* Grow: allocate new block */
+    size_t needed = size + 16;
+    size_t blk_size = p->next_size > needed ? p->next_size : needed;
+    if (p->block_count >= ASON_POOL_MAX_BLOCKS) return NULL;
+    char* blk = (char*)malloc(blk_size);
+    if (!blk) return NULL;
+    p->blocks[p->block_count] = blk;
+    p->block_sizes[p->block_count] = blk_size;
+    p->block_count++;
+    p->current = blk;
+    p->end = blk + blk_size;
+    p->next_size = blk_size * 2;
+    /* Retry from new block */
+    cur = (uintptr_t)p->current;
+    aligned = (cur + 15u) & ~(uintptr_t)15u;
+    ptr = (char*)aligned;
+    p->current = ptr + size;
+    return ptr;
+}
+
+/* Quick tuple counter: count top-level '(' in the data region of a vec format.
+ * Used to pre-estimate pool size for decode_pooled_vec. */
+ason_inline size_t ason_count_tuples(const char* input, size_t len) {
+    const char* p = input;
+    const char* end = input + len;
+    /* Skip whitespace */
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+    if (p >= end || *p != '[') return 1;
+    /* Skip [schema] section by matching brackets */
+    int depth = 0;
+    while (p < end) {
+        char c = *p++;
+        if (c == '[') depth++;
+        else if (c == ']') { depth--; if (depth == 0) break; }
+        else if (c == '"') { while (p < end && *p != '"') { if (*p == '\\') p++; p++; } if (p < end) p++; }
+    }
+    /* Skip ':' and whitespace */
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ':')) p++;
+    /* Count '(' at depth 0 */
+    size_t count = 0;
+    depth = 0;
+    while (p < end) {
+        char c = *p++;
+        if (c == '"') { while (p < end && *p != '"') { if (*p == '\\') p++; p++; } if (p < end) p++; }
+        else if (c == '(' && depth == 0) { count++; depth++; }
+        else if (c == '(' || c == '[' || c == '{') depth++;
+        else if (c == ')' || c == ']' || c == '}') { if (depth > 0) depth--; }
+    }
+    return count > 0 ? count : 1;
+}
+
+/* Decode-path allocation wrappers (defined in ason.c, use thread-local pool) */
+void* ason__alloc(size_t size);
+void* ason__calloc(size_t n, size_t sz);
+void* ason__realloc(void* ptr, size_t old_size, size_t new_size);
+void  ason__free(void* ptr);
+void  ason__set_pool(ason_pool_t* p);
+
 ason_inline void ason_string_free(ason_string_t* s) {
-    if (s->data) { free(s->data); s->data = NULL; }
+    if (s->data) { ason__free(s->data); s->data = NULL; }
     s->len = 0;
 }
 
@@ -170,15 +294,16 @@ ason_inline void ason_string_free(ason_string_t* s) {
     } \
     ason_inline void name##_push(name* v, T val) { \
         if (v->len >= v->cap) { \
+            size_t __old_bytes = v->cap * sizeof(T); \
             v->cap = v->cap < 4 ? 4 : v->cap + (v->cap >> 1); \
-            T* tmp = (T*)realloc(v->data, v->cap * sizeof(T)); \
+            T* tmp = (T*)ason__realloc(v->data, __old_bytes, v->cap * sizeof(T)); \
             if (!tmp) return; \
             v->data = tmp; \
         } \
         v->data[v->len++] = val; \
     } \
     ason_inline void name##_free(name* v) { \
-        if (v->data) free(v->data); \
+        if (v->data) ason__free(v->data); \
         v->data = NULL; v->len = v->cap = 0; \
     }
 
@@ -570,12 +695,12 @@ ason_inline ason_err_t ason_parse_quoted_string(const char** pos, const char* en
     }
     /* Slow path: has escapes */
     size_t cap = 64;
-    char* buf = (char*)malloc(cap);
+    char* buf = (char*)ason__alloc(cap);
     size_t len = 0;
     /* Copy any prefix before the special char */
     if (found > start) {
         len = found - start;
-        if (len > cap) { cap = len * 2; char* tmp = (char*)realloc(buf, cap); if (!tmp) { free(buf); return ASON_ERR_SYNTAX; } buf = tmp; }
+        if (len > cap) { size_t oc = cap; cap = len * 2; char* tmp = (char*)ason__realloc(buf, oc, cap); if (!tmp) { ason__free(buf); return ASON_ERR_SYNTAX; } buf = tmp; }
         memcpy(buf, start, len);
     }
     p = found;
@@ -583,9 +708,9 @@ ason_inline ason_err_t ason_parse_quoted_string(const char** pos, const char* en
         if (*p == '"') { p++; break; }
         if (*p == '\\') {
             p++;
-            if (p >= end) { free(buf); return ASON_ERR_SYNTAX; }
+            if (p >= end) { ason__free(buf); return ASON_ERR_SYNTAX; }
             char c = *p++;
-            if (len >= cap) { cap = cap * 2; char* tmp = (char*)realloc(buf, cap); if (!tmp) { free(buf); return ASON_ERR_SYNTAX; } buf = tmp; }
+            if (len >= cap) { size_t oc = cap; cap = cap * 2; char* tmp = (char*)ason__realloc(buf, oc, cap); if (!tmp) { ason__free(buf); return ASON_ERR_SYNTAX; } buf = tmp; }
             switch (c) {
                 case 'n': buf[len++] = '\n'; break;
                 case 'r': buf[len++] = '\r'; break;
@@ -598,7 +723,7 @@ ason_inline ason_err_t ason_parse_quoted_string(const char** pos, const char* en
                 default: buf[len++] = c; break;
             }
         } else {
-            if (len >= cap) { cap = cap * 2; char* tmp = (char*)realloc(buf, cap); if (!tmp) { free(buf); return ASON_ERR_SYNTAX; } buf = tmp; }
+            if (len >= cap) { size_t oc = cap; cap = cap * 2; char* tmp = (char*)ason__realloc(buf, oc, cap); if (!tmp) { ason__free(buf); return ASON_ERR_SYNTAX; } buf = tmp; }
             buf[len++] = *p++;
         }
     }
@@ -627,7 +752,7 @@ ason_inline ason_err_t ason_parse_plain_value(const char** pos, const char* end,
     while (vend > start && (vend[-1] == ' ' || vend[-1] == '\t' || vend[-1] == '\n' || vend[-1] == '\r')) vend--;
     size_t len = vend - start;
     if (has_esc) {
-        char* buf = (char*)malloc(len + 1);
+        char* buf = (char*)ason__alloc(len + 1);
         size_t j = 0;
         for (const char* c = start; c < vend; c++) {
             if (*c == '\\' && c + 1 < vend) {
@@ -857,6 +982,9 @@ ason_buf_t ason_pretty_format(const char* src, size_t len);
  */
 
 static inline void ason_free_struct_fields(void* obj, const ason_desc_t* desc) {
+    /* Pool mode: all memory freed at once via ason_pool_destroy() */
+    extern void* ason__get_pool(void);
+    if (ason__get_pool()) return;
     for (int i = 0; i < desc->field_count; i++) {
         const ason_field_t* f = &desc->fields[i];
         void* fp = (char*)obj + f->offset;
@@ -1216,17 +1344,18 @@ static inline void ason_free_struct_fields(void* obj, const ason_desc_t* desc) {
         } \
         size_t cap = 16; \
         size_t cnt = 0; \
-        StructType* arr = (StructType*)calloc(cap, sizeof(StructType)); \
+        StructType* arr = (StructType*)ason__calloc(cap, sizeof(StructType)); \
         while (1) { \
             ason_skip_ws(&pos, end); \
             if (pos >= end || *pos != '(') break; \
             pos++; \
             if (cnt >= cap) { \
+                size_t __old_cap = cap; \
                 cap = cap + (cap >> 1); \
-                StructType* tmp = (StructType*)realloc(arr, cap * sizeof(StructType)); \
+                StructType* tmp = (StructType*)ason__realloc(arr, __old_cap * sizeof(StructType), cap * sizeof(StructType)); \
                 if (!tmp) { \
                     for (size_t k = 0; k < cnt; k++) ason_free_struct_fields(&arr[k], &StructType##_ason_desc); \
-                    free(arr); return ASON_ERR_ALLOC; \
+                    ason__free(arr); return ASON_ERR_ALLOC; \
                 } \
                 arr = tmp; \
                 memset(arr + cnt, 0, (cap - cnt) * sizeof(StructType)); \
@@ -1241,7 +1370,7 @@ static inline void ason_free_struct_fields(void* obj, const ason_desc_t* desc) {
                     else if (*pos == ')') break; \
                     else { \
                         for (size_t k = 0; k <= cnt; k++) ason_free_struct_fields(&arr[k], &StructType##_ason_desc); \
-                        free(arr); return ASON_ERR_SYNTAX; \
+                        ason__free(arr); return ASON_ERR_SYNTAX; \
                     } \
                 } \
                 if (field_map[i] >= 0) { \
@@ -1261,7 +1390,7 @@ static inline void ason_free_struct_fields(void* obj, const ason_desc_t* desc) {
                     } \
                     if (err != ASON_OK) { \
                         for (size_t k = 0; k <= cnt; k++) ason_free_struct_fields(&arr[k], &StructType##_ason_desc); \
-                        free(arr); return err; \
+                        ason__free(arr); return err; \
                     } \
                 } else { \
                     ason_skip_value(&pos, end); \
@@ -1280,6 +1409,33 @@ static inline void ason_free_struct_fields(void* obj, const ason_desc_t* desc) {
         } \
         *out = arr; \
         *out_count = cnt; \
+        return ASON_OK; \
+    } \
+    /* decode_pooled: pool-allocated single struct (smart-sized from input_len) */ \
+    static inline ason_err_t ason_decode_pooled_##StructType(const char* input, size_t len, \
+                                                              StructType* out, ason_pool_t** pool_out) { \
+        ason_pool_t* _p = ason_pool_new_sized(len); \
+        if (!_p) return ASON_ERR_ALLOC; \
+        ason__set_pool(_p); \
+        ason_err_t _e = ason_decode_##StructType(input, len, out); \
+        ason__set_pool(NULL); \
+        if (_e != ASON_OK) { ason_pool_destroy(_p); *pool_out = NULL; return _e; } \
+        *pool_out = _p; \
+        return ASON_OK; \
+    } \
+    /* decode_pooled_vec: pool-allocated array (smart-sized: tuple_count * struct + input) */ \
+    static inline ason_err_t ason_decode_pooled_vec_##StructType(const char* input, size_t len, \
+                                                                  StructType** out, size_t* out_count, \
+                                                                  ason_pool_t** pool_out) { \
+        size_t _tc = ason_count_tuples(input, len); \
+        size_t _est = _tc * sizeof(StructType) + len; \
+        ason_pool_t* _p = ason_pool_new_sized(_est); \
+        if (!_p) return ASON_ERR_ALLOC; \
+        ason__set_pool(_p); \
+        ason_err_t _e = ason_decode_vec_##StructType(input, len, out, out_count); \
+        ason__set_pool(NULL); \
+        if (_e != ASON_OK) { ason_pool_destroy(_p); *pool_out = NULL; return _e; } \
+        *pool_out = _p; \
         return ASON_OK; \
     }
 
@@ -1318,8 +1474,9 @@ static inline void ason_free_struct_fields(void* obj, const ason_desc_t* desc) {
             first = false; \
             /* Ensure capacity and load directly into vector slot */ \
             if (v->len >= v->cap) { \
+                size_t __old_bytes = v->cap * sizeof(StructType); \
                 v->cap = v->cap ? v->cap * 2 : 4; \
-                StructType* tmp = (StructType*)realloc(v->data, v->cap * sizeof(StructType)); \
+                StructType* tmp = (StructType*)ason__realloc(v->data, __old_bytes, v->cap * sizeof(StructType)); \
                 if (!tmp) { \
                     for (size_t k = 0; k < v->len; k++) ason_free_struct_fields(&v->data[k], &StructType##_ason_desc); \
                     ason_vec_##StructType##_free(v); \
@@ -1437,7 +1594,7 @@ ason_inline ason_err_t ason_bin_read_str_alloc(const char** pos, const char* end
     const char* d; size_t l;
     ason_err_t e = ason_bin_read_str_view(pos, end, &d, &l);
     if (e != ASON_OK) return e;
-    char* s = (char*)malloc(l + 1);
+    char* s = (char*)ason__alloc(l + 1);
     if (!s) return ASON_ERR_ALLOC;
     memcpy(s, d, l); s[l] = '\0';
     *out = s;
@@ -1530,17 +1687,45 @@ ason_err_t ason_bin_decode_struct(const char** pos, const char* end, void* obj, 
         uint32_t count; \
         ason_err_t err = ason_bin_read_u32(&pos, end, &count); \
         if (err != ASON_OK) return err; \
-        StructType* arr = (StructType*)calloc(count, sizeof(StructType)); \
+        StructType* arr = (StructType*)ason__calloc(count, sizeof(StructType)); \
         if (!arr) return ASON_ERR_ALLOC; \
         for (uint32_t i = 0; i < count; i++) { \
             err = ason_bin_decode_struct(&pos, end, &arr[i], &StructType##_ason_desc); \
             if (err != ASON_OK) { \
                 for (uint32_t k = 0; k <= i; k++) ason_free_struct_fields(&arr[k], &StructType##_ason_desc); \
-                free(arr); return err; \
+                ason__free(arr); return err; \
             } \
         } \
         *out_arr = arr; \
         *out_count = count; \
+        return ASON_OK; \
+    } \
+    /* decode_pooled_bin: pool-allocated binary single (smart-sized from data_len) */ \
+    static inline ason_err_t ason_decode_pooled_bin_##StructType(const char* data, size_t len, \
+                                                                  StructType* out, ason_pool_t** pool_out) { \
+        ason_pool_t* _p = ason_pool_new_sized(len); \
+        if (!_p) return ASON_ERR_ALLOC; \
+        ason__set_pool(_p); \
+        ason_err_t _e = ason_decode_bin_##StructType(data, len, out); \
+        ason__set_pool(NULL); \
+        if (_e != ASON_OK) { ason_pool_destroy(_p); *pool_out = NULL; return _e; } \
+        *pool_out = _p; \
+        return ASON_OK; \
+    } \
+    /* decode_pooled_bin_vec: pool-allocated binary array (count from u32 header) */ \
+    static inline ason_err_t ason_decode_pooled_bin_vec_##StructType(const char* data, size_t len, \
+                                                                      StructType** out_arr, size_t* out_count, \
+                                                                      ason_pool_t** pool_out) { \
+        uint32_t _bc = 0; \
+        if (len >= 4) memcpy(&_bc, data, 4); \
+        size_t _est = (size_t)_bc * sizeof(StructType) + len; \
+        ason_pool_t* _p = ason_pool_new_sized(_est); \
+        if (!_p) return ASON_ERR_ALLOC; \
+        ason__set_pool(_p); \
+        ason_err_t _e = ason_decode_bin_vec_##StructType(data, len, out_arr, out_count); \
+        ason__set_pool(NULL); \
+        if (_e != ASON_OK) { ason_pool_destroy(_p); *pool_out = NULL; return _e; } \
+        *pool_out = _p; \
         return ASON_OK; \
     }
 

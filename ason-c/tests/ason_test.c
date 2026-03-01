@@ -987,6 +987,166 @@ void test_encode_pretty_typed_bool_vec_field(void) {
 }
 
 /* ===========================================================================
+ * Pool allocator tests
+ * =========================================================================== */
+
+ASON_FIELDS_BIN(TSimple, 3)
+
+static void test_pool_basic(void) {
+    TEST(pool_basic);
+    /* Default pool uses MIN_SIZE (4096) */
+    ason_pool_t* pool = ason_pool_new();
+    ASSERT_TRUE(pool != NULL);
+    ASSERT_EQ_U(pool->block_count, 1);
+    ASSERT_EQ_U(pool->block_sizes[0], ASON_POOL_MIN_SIZE);
+    /* Bump-allocate within the block */
+    void* p1 = ason_pool_alloc(pool, 100);
+    ASSERT_TRUE(p1 != NULL);
+    void* p2 = ason_pool_alloc(pool, 200);
+    ASSERT_TRUE(p2 != NULL);
+    ASSERT_TRUE(p2 != p1);
+    ASSERT_EQ_U(pool->block_count, 1);
+    ason_pool_destroy(pool);
+    /* Sized pool: request 8000 bytes initial */
+    pool = ason_pool_new_sized(8000);
+    ASSERT_TRUE(pool != NULL);
+    ASSERT_EQ_U(pool->block_count, 1);
+    ASSERT_EQ_U(pool->block_sizes[0], 8000);
+    ason_pool_destroy(pool);
+    /* Sized pool: small request gets clamped to MIN_SIZE */
+    pool = ason_pool_new_sized(100);
+    ASSERT_TRUE(pool != NULL);
+    ASSERT_EQ_U(pool->block_sizes[0], ASON_POOL_MIN_SIZE);
+    ason_pool_destroy(pool);
+    PASS();
+}
+
+static void test_pool_decode_single(void) {
+    TEST(pool_decode_single);
+    const char* input = "{id,name,active}:(42,hello,true)";
+    TSimple out = {0};
+    ason_pool_t* pool = NULL;
+    ason_err_t err = ason_decode_pooled_TSimple(input, strlen(input), &out, &pool);
+    ASSERT_TRUE(err == ASON_OK);
+    ASSERT_TRUE(pool != NULL);
+    ASSERT_EQ_I(out.id, 42);
+    ASSERT_EQ_S(out.name.data, "hello");
+    ASSERT_TRUE(out.active == true);
+    /* Pool-allocated: don't call free_struct_fields, just destroy pool */
+    ason_pool_destroy(pool);
+    PASS();
+}
+
+static void test_pool_decode_vec(void) {
+    TEST(pool_decode_vec);
+    const char* input = "[{id,name,active}]:(1,alice,true),(2,bob,false),(3,charlie,true)";
+    TSimple* arr = NULL;
+    size_t count = 0;
+    ason_pool_t* pool = NULL;
+    ason_err_t err = ason_decode_pooled_vec_TSimple(input, strlen(input), &arr, &count, &pool);
+    ASSERT_TRUE(err == ASON_OK);
+    ASSERT_TRUE(pool != NULL);
+    ASSERT_EQ_U(count, 3);
+    ASSERT_EQ_I(arr[0].id, 1);
+    ASSERT_EQ_S(arr[0].name.data, "alice");
+    ASSERT_EQ_I(arr[1].id, 2);
+    ASSERT_EQ_S(arr[1].name.data, "bob");
+    ASSERT_EQ_I(arr[2].id, 3);
+    ASSERT_EQ_S(arr[2].name.data, "charlie");
+    ason_pool_destroy(pool);
+    PASS();
+}
+
+static void test_pool_decode_binary(void) {
+    TEST(pool_decode_binary);
+    /* Encode with standard path */
+    TSimple orig = { .id = 99, .name = ason_string_from("binary_test"), .active = true };
+    ason_buf_t bin = ason_encode_bin_TSimple(&orig);
+    /* Pool-decode binary */
+    TSimple out = {0};
+    ason_pool_t* pool = NULL;
+    ason_err_t err = ason_decode_pooled_bin_TSimple(bin.data, bin.len, &out, &pool);
+    ASSERT_TRUE(err == ASON_OK);
+    ASSERT_TRUE(pool != NULL);
+    ASSERT_EQ_I(out.id, 99);
+    ASSERT_EQ_S(out.name.data, "binary_test");
+    ASSERT_TRUE(out.active == true);
+    ason_pool_destroy(pool);
+    ason_buf_free(&bin);
+    ason_string_free(&orig.name);
+    PASS();
+}
+
+static void test_pool_decode_nested(void) {
+    TEST(pool_decode_nested);
+    const char* input = "{label,inner:{val,n}}:(world,(nested,7))";
+    TOuter out = {0};
+    ason_pool_t* pool = NULL;
+    ason_err_t err = ason_decode_pooled_TOuter(input, strlen(input), &out, &pool);
+    ASSERT_TRUE(err == ASON_OK);
+    ASSERT_TRUE(pool != NULL);
+    ASSERT_EQ_S(out.label.data, "world");
+    ASSERT_EQ_S(out.inner.val.data, "nested");
+    ASSERT_EQ_I(out.inner.n, 7);
+    ason_pool_destroy(pool);
+    PASS();
+}
+
+static void test_pool_growth(void) {
+    TEST(pool_growth);
+    /* Start with a small 4096-byte pool */
+    ason_pool_t* pool = ason_pool_new_sized(4096);
+    ASSERT_TRUE(pool != NULL);
+    ASSERT_EQ_U(pool->block_count, 1);
+    ASSERT_EQ_U(pool->block_sizes[0], 4096u);
+    /* Fill the 4KB block (4 x 1024 = 4KB) */
+    for (int i = 0; i < 4; i++) {
+        void* p = ason_pool_alloc(pool, 1024);
+        ASSERT_TRUE(p != NULL);
+    }
+    /* Next alloc triggers a second block (doubled: 8KB) */
+    void* p = ason_pool_alloc(pool, 1024);
+    ASSERT_TRUE(p != NULL);
+    ASSERT_EQ_U(pool->block_count, 2);
+    ASSERT_EQ_U(pool->block_sizes[1], 8192u);
+    ason_pool_destroy(pool);
+    PASS();
+}
+
+static void test_pool_smart_sizing(void) {
+    TEST(pool_smart_sizing);
+    /* Single struct: pool sized from input_len */
+    const char* input = "{id,name,active}:(42,hello,true)";
+    size_t len = strlen(input);
+    TSimple out = {0};
+    ason_pool_t* pool = NULL;
+    ason_err_t err = ason_decode_pooled_TSimple(input, len, &out, &pool);
+    ASSERT_TRUE(err == ASON_OK);
+    ASSERT_TRUE(pool != NULL);
+    /* Pool should be min(input_len, 4096) = 4096, NOT 128KB */
+    ASSERT_EQ_U(pool->block_sizes[0], ASON_POOL_MIN_SIZE);
+    ASSERT_TRUE(pool->block_sizes[0] < 128u * 1024u);
+    ason_pool_destroy(pool);
+    /* Vec: pool sized from count * sizeof + input_len */
+    const char* vinput = "[{id,name,active}]:(1,alice,true),(2,bob,false),(3,charlie,true)";
+    size_t vlen = strlen(vinput);
+    TSimple* arr = NULL;
+    size_t count = 0;
+    pool = NULL;
+    err = ason_decode_pooled_vec_TSimple(vinput, vlen, &arr, &count, &pool);
+    ASSERT_TRUE(err == ASON_OK);
+    ASSERT_EQ_U(count, 3);
+    /* Pool should be proportional to input, NOT 128KB */
+    ASSERT_TRUE(pool->block_sizes[0] < 128u * 1024u);
+    /* Verify tuple counter: 3 tuples * sizeof(TSimple) + input_len */
+    size_t expected_est = 3 * sizeof(TSimple) + vlen;
+    if (expected_est < ASON_POOL_MIN_SIZE) expected_est = ASON_POOL_MIN_SIZE;
+    ASSERT_EQ_U(pool->block_sizes[0], expected_est);
+    ason_pool_destroy(pool);
+    PASS();
+}
+
+/* ===========================================================================
  * Main
  * =========================================================================== */
 
@@ -1069,6 +1229,15 @@ int main(void) {
     test_encode_typed_str_vec_field();
     test_encode_typed_empty_bool_vec();
     test_encode_pretty_typed_bool_vec_field();
+
+    printf("\n--- Pool allocator ---\n");
+    test_pool_basic();
+    test_pool_decode_single();
+    test_pool_decode_vec();
+    test_pool_decode_binary();
+    test_pool_decode_nested();
+    test_pool_growth();
+    test_pool_smart_sizing();
 
     printf("\n=== Results: %d passed, %d failed ===\n", tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

@@ -25,6 +25,9 @@ target_link_libraries(complex_example ason m)
 add_executable(bench examples/bench.c)
 target_link_libraries(bench ason m)
 
+add_executable(pool_bench examples/pool_bench.c)
+target_link_libraries(pool_bench ason m)
+
 add_executable(cross_compat examples/cross_compat.c)
 target_link_libraries(cross_compat ason m)
 
